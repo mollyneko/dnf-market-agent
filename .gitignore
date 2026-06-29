@@ -1,0 +1,6 @@
+.DS_Store
+temp/
+*.log
+__pycache__/
+*.pyc
+dist/
