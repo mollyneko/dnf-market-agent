@@ -441,8 +441,9 @@ def _insert_creature_items_autoinc(cur_g, rows):
 
 def restock_special(m, conn_mk):
     """补货特殊类(称号/装扮/红蓝绿装备/宠物): 全部挂普通系统 90M 假 owner, 零桩.
-    称号/装扮/蓝绿装备 add_info=0(白板); 宠物建 creature_items 实例并令其 charac_no=该 owner(加载要求 owner==charac_no),
-    用自增 ui_id 当 add_info. (DROP_TOKENS 默认空=无类型排除; 若某 type_token 确实零桩无法上架, 加入其 token 即跳过补货.)"""
+    称号/装扮/蓝绿装备 add_info 取高位段唯一递增(=0 重复会崩 RegistItem); 宠物建 creature_items 实例并令其
+    charac_no=该 owner(加载要求 owner==charac_no), 用自增 ui_id 当 add_info.
+    (DROP_TOKENS 默认空=无类型排除; 若某 type_token 确实零桩无法上架, 加入其 token 即跳过补货.)"""
     if not SP_ENABLED or not SP_TOKENS:
         return
     owner_name = m.get("owner_name", u"拍卖行")
@@ -559,10 +560,12 @@ def restock_catalog_list(m, conn_mk, conn_frida):
         return oid
 
     # 装备各字段按 item_catalog 属性自动判定(均为实测合法值; restock_list 的 upgrade/endurance/seal_flag 不再使用):
-    #   add_info: 宠物(creature)=1(数量); 其余装备=0(品级白板). 填错品级 -> RegistItem 崩、整服起不来.
+    #   add_info: 宠物(creature)=1(数量); 称号/红蓝绿装备=0; 普通装备=EQUIP_GRADE(最上级品级.
+    #     ★白板0能加载能购买, 但玩家维修后装备消失; 非法品级 -> RegistItem 崩、整服起不来★).
     #   endurance: 称号/宠物/红蓝绿装备无耐久=0; 武器/防具等普通装备=35.
     #   seal_flag(封装): 稀有及以上(rarity>=2)=1; 否则 0.
     NO_ENDUR = ("creature", "artifact red", "artifact blue", "artifact green", "title name")  # 称号/宠物/红蓝绿装备无耐久
+    EQUIP_GRADE = 999999998  # 普通装备补货品级(实测最上级合法值)
     rows, total = [], 0
     for item_id, system_price, quantity, stack_size, upgrade, endurance, seal_flag, kind, type_token, rarity in items:
         if (SP_ENABLED and type_token in SP_TOKENS) or type_token in SP_DROP_TOKENS:
@@ -576,7 +579,7 @@ def restock_catalog_list(m, conn_mk, conn_frida):
             tok = type_token or ""
             eq_endur = 0 if tok in NO_ENDUR else 35
             eq_seal = 1 if (rarity is not None and int(rarity) >= 2) else 0
-            eq_addinfo = 1 if tok == "creature" else 0
+            eq_addinfo = 1 if tok == "creature" else (0 if tok in NO_ENDUR else EQUIP_GRADE)
         for i in range(need):
             pos = current + i
             if is_equip:
