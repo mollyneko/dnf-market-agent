@@ -45,8 +45,8 @@
       "label": "拍卖行",
       "db": "taiwan_cain_auction_gold",
       "owner_name": "拍卖行",
-      "stop_cmd": "killall -9 df_auction_r 2>/dev/null; sleep 2; rm -f /home/neople/auction/pid/*.pid",
-      "start_cmd": "cd /home/neople/auction && setsid nohup ./df_auction_r ./cfg/server.cfg start ./df_auction_r >/dev/null 2>&1 < /dev/null &",
+      "stop_cmd": "/command/s6-svc -d -wd -T 30000 /run/service/auction",
+      "start_cmd": "/command/s6-svc -u /run/service/auction",
       "restock": {
         "mode": "catalog_list",
         "list": "restock_list",
@@ -73,8 +73,8 @@
       "label": "金币寄售",
       "db": "taiwan_cain_auction_cera",
       "owner_name": "金币寄售",
-      "stop_cmd": "killall -9 df_point_r 2>/dev/null; sleep 2; rm -f /home/neople/point/pid/*.pid",
-      "start_cmd": "cd /home/neople/point && setsid nohup ./df_point_r ./cfg/server.cfg start df_point_r >/dev/null 2>&1 < /dev/null &",
+      "stop_cmd": "/command/s6-svc -d -wd -T 30000 /run/service/point",
+      "start_cmd": "/command/s6-svc -u /run/service/point",
       "restock": {
         "mode": "fixed_list",
         "list": "cera_consign_list",
