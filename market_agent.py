@@ -70,6 +70,32 @@ ROTATE_EVERY = int(SYS.get("rotate_every", 10))           # 每多少件轮换�
 
 FRIDA_DB = MYSQL["frida_db"]
 
+# ---- ★装备 ROI 键(v6 修复, 2026-10-14 只读反汇编定论)★ ----
+# 症状: 客户端上传/浏览"装备"显示"拍卖行平均价0金币"+"暂无拍卖品"; 材料(黑曜石/金刚石)正常.
+# 根因(反汇编 df_game_r / df_auction_r):
+#   · 游戏服 Dispatcher_AuctionAskAveragePrice::dispatch_sig(@0x08213940) 与
+#     Dispatcher_AuctionRegistItem::dispatch_sig(@0x08213e8a) 在转发均价查询/注册包前, 对
+#     item->IsRandomOption()==true 的物品(CEquipItem 且 .equ 脚本含 [random option] token,
+#     见 ImportEquipmentScript @0x08991aeb 对 STEquipmentScript+0x888 的置位), 把客户端传来的
+#     3 个 roi_high WORD(为 0 的)全部填 0x7530(@0x08213cf8 / @0x0821471e).
+#   · 拍卖服 AveragePriceDictionary::GetItemAveragePrice(@0x080645d0) 按 ROI_Category::isEmpty()
+#     分流: 全 0 -> 简单表 auction_average_price(键 item_id); 非空 -> ROI 表 auction_roi_average_price
+#     (键 = ROI_AverageKey = item_id + roi_high_key(8B) + roi_low_key(4B) + 排序后的 roi_index1/2/3).
+#     ASK handler(@0x080741a2) 的键由包内字段原样拼成: key[4]=*(u32*)pck+0x22, key[8]=*(u32*)pck+0x26,
+#     key[12]=*(u32*)pck+0x2a, idx=pck+0x1f..0x21 排序.
+#   => 装备查询键非空(三 WORD 全 0x7530) -> 只查 ROI 表; 而我们的装备挂单 roi 全 0 + ROI 表无装备行
+#      -> 均价恒 0. 搜索侧 Search::GetAuctionItemInfo(@0x08081760) 仅在查询 roi 非空时用
+#      ROI_Category::isMatching(@0x08083ac8) 过滤(任一侧为空 -> 不匹配), 故 roi=0 挂单被
+#      "非空查询"滤掉 -> "暂无拍卖品".
+# 修复: ① 装备(含称号/装扮/红蓝绿装备等 kind=equipment)挂单写 roi_high_key=EQUIP_ROI_HIGH,
+#          roi_low_key=0(与真实玩家注册落地值一致); 材料/消耗品仍 0(走简单表).
+#       ② 均价回灌时对带该 roi 键的挂单按 (item_id, upgrade 0..EQUIP_ROI_MAX_UPGRADE) 写
+#          auction_roi_average_price 行(sep=0/idx=0), 客户端无论查哪个强化档都能命中.
+#       ★安全性★: 打 roi 键不影响搜索 —— 查询 roi 为空时(不触发填充的物品)根本不调用 isMatching,
+#       挂单 roi 为何值都能被检索到; 查询 roi 非空时(触发填充的装备)才需匹配, 而我们的键正是填充值.
+EQUIP_ROI_HIGH = 0x7530 | (0x7530 << 16) | (0x7530 << 32)   # = 128850984990000 (三 WORD 0x7530)
+EQUIP_ROI_MAX_UPGRADE = int(SYS.get("equip_roi_max_upgrade", 18))   # 回灌覆盖的强化档上限(含 0)
+
 # ---- 特殊类(称号/装扮/红蓝绿装备/宠物)补货配置 ----
 # 全挂普通系统 90M 假 owner 零桩补货(加载硬条件/历史误诊详见下方 SP_TOKENS 处 ★零桩★ 注释).
 SPECIAL = SYS.get("special", {})
@@ -457,19 +483,21 @@ _INSERT_COLS = (
     " random_option, roi_high_key, roi_low_key, seperate_upgrade, item_guid"
     ") VALUES "
 )
-# 13 个 %s 顺序: auction_id, expire_time, owner_id, owner_name, owner_type, owner_nexon,
-#                instant_price, seal_flag, item_id, add_info, upgrade, endurance, unit_price
+# 15 个 %s 顺序: auction_id, expire_time, owner_id, owner_name, owner_type, owner_nexon,
+#                instant_price, seal_flag, item_id, add_info, upgrade, endurance, unit_price,
+#                roi_high_key, roi_low_key
+# 装备行 roi_high_key=EQUIP_ROI_HIGH/roi_low_key=0(见顶部 v6 注释); 材料/消耗品/金币包填 0.
 _ROW_TMPL = (
     "(%s, NOW(), %s, %s, %s, %s, %s,"
     " -1, '', -1, %s, %s, %s, %s, %s,"
     " 0, 0, 0, %s, 0, 0, %s,"
-    " UNHEX(REPEAT('00',14)), 0, 0, 0, UNHEX(REPEAT('00',10)))"
+    " UNHEX(REPEAT('00',14)), %s, %s, 0, UNHEX(REPEAT('00',10)))"
 )
 _BATCH = 500
 
 
 def _insert_listings(cur_a, rows):
-    """批量插 auction_main; rows = list of 13-tuple(顺序同 _ROW_TMPL)."""
+    """批量插 auction_main; rows = list of 15-tuple(顺序同 _ROW_TMPL)."""
     for i in range(0, len(rows), _BATCH):
         chunk = rows[i:i + _BATCH]
         sql = _INSERT_COLS + ",".join([_ROW_TMPL] * len(chunk))
@@ -520,7 +548,7 @@ def restock_special(m, conn_mk):
     cur_f = conn_frida.cursor()
     ph = ",".join(["%s"] * len(SP_TOKENS))
     cur_f.execute(
-        "SELECT r.item_id, r.system_price, r.quantity, c.type_token "
+        "SELECT r.item_id, r.system_price, r.quantity, c.type_token, c.kind "
         "FROM restock_list r JOIN item_catalog c ON r.item_id = c.item_id "
         "WHERE c.type_token IN (" + ph + ")", tuple(SP_TOKENS))
     items = cur_f.fetchall()
@@ -530,7 +558,8 @@ def restock_special(m, conn_mk):
 
     # 缺口 + 系统 90M owner 占用(一次全表扫描): have 按 item 算缺口, occ 按 owner 做轮换装箱
     occ, have = _collect_occ_have(cur_a)
-    plan = [(int(iid), int(sp), max(0, int(q) - have.get(int(iid), 0)), tok) for iid, sp, q, tok in items]
+    plan = [(int(iid), int(sp), max(0, int(q) - have.get(int(iid), 0)), tok, kd)
+            for iid, sp, q, tok, kd in items]
     total_need = sum(p[2] for p in plan)
     if total_need <= 0:
         log.info(u"  [特殊] 无缺口, 跳过")
@@ -553,20 +582,21 @@ def restock_special(m, conn_mk):
         next_id = [cur_a.fetchone()[0] + 1]                # 列表做可变计数器(闭包内自增)
         expire_time = int(time.time()) + 24 * 3600
 
-        # 按装箱顺序定 owner, 拆 宠物 / 非宠物(称号/装扮/蓝绿装备)两路
-        pet_jobs, other_jobs = [], []           # (owner_id, item_id, price)
-        for item_id, system_price, need, token in plan:
+        # 按装箱顺序定 owner, 拆 宠物 / 非宠物(称号/装扮/蓝绿装备)两路; roi 随 kind=equipment 打装备键
+        pet_jobs, other_jobs = [], []           # (owner_id, item_id, price, roi_high)
+        for item_id, system_price, need, token, kind in plan:
             is_creature = token in SP_CREATURE_TOKENS
+            roi_hi = EQUIP_ROI_HIGH if kind == "equipment" else 0
             price = system_price if system_price > 0 else 1
             for _i in range(need):
                 oid = pick_owner()
-                (pet_jobs if is_creature else other_jobs).append((oid, item_id, price))
+                (pet_jobs if is_creature else other_jobs).append((oid, item_id, price, roi_hi))
 
         # 宠物: 建 creature_items 实例(charac_no=该 90M owner, 满足 owner==charac_no), 自增 ui_id 当 add_info.
         # ★ui_id 不手填: 自增, 否则与游戏服并发孵化撞主键(同 letter_id 教训)★
         pet_uiids = []
         if pet_jobs:
-            pet_uiids = _insert_creature_items_autoinc(cur_g, [(o, it) for o, it, _p in pet_jobs])
+            pet_uiids = _insert_creature_items_autoinc(cur_g, [(o, it) for o, it, _p, _r in pet_jobs])
             conn_game.commit()
 
         # 非宠物特殊: add_info 取高位段 MAX+1 唯一递增(★装扮/artifact 的 add_info 必须全局唯一, =0 重复会崩★;
@@ -577,15 +607,15 @@ def restock_special(m, conn_mk):
         next_band = [max(cur_a.fetchone()[0], SP_ADDINFO_BASE - 1) + 1]
 
         rows = []
-        def add_row(oid, item_id, price, add_info):
+        def add_row(oid, item_id, price, add_info, roi_hi):
             # 一口价=系统价(精确品级×系数), seal=1(封装), upgrade=0, endurance=0(无耐久)
             rows.append((next_id[0], expire_time, oid, owner_name[:20], SYS_OWNER_TYPE, str(NEXON_BASE + oid)[:25],
-                         price, 1, item_id, add_info, 0, 0, price))
+                         price, 1, item_id, add_info, 0, 0, price, roi_hi, 0))
             next_id[0] += 1
-        for i, (oid, item_id, price) in enumerate(pet_jobs):
-            add_row(oid, item_id, price, pet_uiids[i])     # 宠物 add_info = creature_items.ui_id
-        for oid, item_id, price in other_jobs:
-            add_row(oid, item_id, price, next_band[0])     # 称号/装扮/蓝绿装备: 高位段唯一 add_info
+        for i, (oid, item_id, price, roi_hi) in enumerate(pet_jobs):
+            add_row(oid, item_id, price, pet_uiids[i], roi_hi)     # 宠物 add_info = creature_items.ui_id
+        for oid, item_id, price, roi_hi in other_jobs:
+            add_row(oid, item_id, price, next_band[0], roi_hi)     # 称号/装扮/蓝绿装备: 高位段唯一 add_info
             next_band[0] += 1
         _insert_listings(cur_a, rows)
         conn_mk.commit()
@@ -717,11 +747,12 @@ def restock_catalog_list(m, conn_mk, conn_frida):
                 rows.append((
                     next_id, expire_time, owner_id, owner_name[:20], SYS_OWNER_TYPE, str(nexon)[:25],
                     instant_price, eq_seal, item_id, add_info, lvl, eq_endur, unit_price,
+                    EQUIP_ROI_HIGH, 0,                           # 装备: 打 roi 键(见顶部 v6 注释)
                 ))
-            else:                                              # 材料/消耗品: seal=0, upgrade=0, endurance=0
+            else:                                              # 材料/消耗品: seal=0, upgrade=0, endurance=0, roi=0
                 rows.append((
                     next_id, expire_time, owner_id, owner_name[:20], SYS_OWNER_TYPE, str(nexon)[:25],
-                    instant_price, 0, item_id, add_info, 0, 0, unit_price,
+                    instant_price, 0, item_id, add_info, 0, 0, unit_price, 0, 0,
                 ))
             occ[owner_id] = occ.get(owner_id, 0) + 1
             next_id += 1
@@ -766,10 +797,10 @@ def restock_fixed_list(m, conn_mk, conn_frida):
         for _i in range(need):
             owner_id = pick_owner()
             nexon = NEXON_BASE + owner_id
-            # 金币包寄售单: add_info=1(不堆叠), instant_price=代币券标价, unit_price=0, seal/upgrade/endurance=0
+            # 金币包寄售单: add_info=1(不堆叠), instant_price=代币券标价, unit_price=0, seal/upgrade/endurance/roi=0
             rows.append((
                 next_id, expire_time, owner_id, owner_name[:20], SYS_OWNER_TYPE, str(nexon)[:25],
-                int(restock_price), 0, item_id, 1, 0, 0, 0,
+                int(restock_price), 0, item_id, 1, 0, 0, 0, 0, 0,
             ))
             occ[owner_id] = occ.get(owner_id, 0) + 1
             next_id += 1
@@ -790,6 +821,96 @@ def do_restock(m, conn_mk, conn_frida):
         restock_fixed_list(m, conn_mk, conn_frida)
     else:
         log.warning(u"  未知补货 mode=%s, 跳过", mode)
+    _backfill_average_price(m, conn_mk, conn_frida)   # 补货轮末: 重建均价表(整表镜像+装备全强化档参考, 客户端上架查均价用)
+
+
+AVG_PRICE_SEED_SQL = {
+    # 游戏模板自带均价种子(来源: 容器内 /home/template/init/init_sql/taiwan_cain_auction_{gold,cera}.sql 的
+    # "INSERT INTO auction_average_price VALUES ..."), 原样抄录. 作用: 回灌均价表时补回"无挂单物品"的
+    # 种子行(游戏原版这些物品也能显示平均价); 有挂单的 (item_id,upgrade) 一律以在架 AVG 为准(INSERT IGNORE 跳过).
+    # ★踩坑记录★: v5 曾用整表 DELETE+INSERT 重建, 把无挂单的种子行(金库 27 个/cera 1 个)冲掉 -> 那些
+    # 物品均价从有种子的价格变成 0, 属于回归; 故加本常量 + INSERT IGNORE 补缺.
+    "taiwan_cain_auction_gold": "(1090,0,5000000,0),(3027,0,2000,0),(3033,0,999,0),(3034,0,1300,0),(3035,0,1300,0),(3036,0,999,0),(3037,0,233,0),(3108,0,3593,0),(3109,0,4444,0),(3112,0,5555,0),(3113,0,1000,0),(3114,0,5312,0),(3115,0,5000,0),(3116,0,2000,0),(3151,0,4000,0),(3170,0,1500,0),(3187,0,122222,0),(3203,0,6666,0),(3205,0,1000,0),(3210,0,50000,0),(3211,0,2510,0),(3212,0,6666,0),(3217,0,5555,0),(3218,0,2333,0),(3227,0,23000000,0),(3230,0,1000,0),(3249,0,6666,0),(3266,0,1000,0),(3269,0,2000,0),(3270,0,1000,0),(3271,0,1000,0),(3272,0,2000,0),(3273,0,1000,0),(3274,0,5000,0),(3275,0,5000,0),(3276,0,2000,0),(3278,0,1000,0),(3279,0,1000,0),(3294,0,9999,0),(3295,0,23333,0),(3298,0,22222,0),(3299,0,25000,0),(3308,0,8888,0),(3309,0,2000,0),(3310,0,1000,0),(3331,0,3000000,0),(3614,0,13000000,0),(3619,0,2000000,0),(3620,0,25000000,0),(3621,0,2000000,0),(3624,0,2000000,0),(3625,0,25000000,0),(3626,0,2187500,0),(3627,0,13000000,0),(3629,0,4000000,0),(3663,0,13000000,0),(4084,0,50000,0),(10082,0,10000000,0),(10164,0,10000000,0),(10165,0,10000000,0),(10489,6,500000,0),(11328,0,30000000,0),(11329,0,200000000,0),(13328,0,200000000,0),(14146,2,10000000,0),(15315,0,1000000,0),(15318,0,200000000,0),(16405,0,700000,0),(17310,4,1000000,0),(17313,0,20000000,0),(17313,4,10000000,0),(17313,5,10000000,0),(18146,0,10000000,0),(19310,0,10000,0),(19320,0,200000000,0),(22092,0,1500000,0),(22142,0,100000,0),(26243,0,21000000,0),(26244,0,20000000,0),(26807,0,1000000,0),(27129,0,50000000,0),(27600,0,22222,0),(27602,0,22222,0),(27671,0,10000,0),(27675,0,99999999,0),(27967,0,1999999,0),(31367,0,12000,0),(63013,0,100000,0),(63014,0,100000,0),(63069,0,968750,0),(63117,0,50000,0),(440045,0,500000,0),(450010,0,2222222,0),(2600014,0,5000,0),(2600018,0,10000,0),(2600021,0,15000,0),(2600026,0,206250,0),(2600068,0,100000,0),(2600075,0,50000,0),(2600081,0,100000,0),(2675336,0,1000,0),(2675345,0,500,0),(2675347,0,50,0),(600330007,0,11025000,0),(600330008,0,10000000,0),(600330010,0,49999999,0),(600330012,0,50000000,0),(690000280,0,100,0)",
+    "taiwan_cain_auction_cera": "(2675336,0,200,0)",
+}
+
+
+def _backfill_average_price(m, conn_mk, conn_frida):
+    # 补货轮末重建两张均价表. ★v6 定论(2026-10-14 只读反汇编 df_game_r / df_auction_r, 见顶部 EQUIP_ROI_HIGH 注释)★
+    #   拍卖服 AveragePriceDictionary::GetItemAveragePrice(@0x080645d0) 按 ROI_Category::isEmpty() 分流:
+    #     a) 查询 roi 全 0 -> 简单表 auction_average_price, 容器 = (upgrade, seperate_upgrade), 键 = item_id;
+    #     b) 查询 roi 非空 -> ROI 表 auction_roi_average_price, 键 = ROI_AverageKey
+    #        = item_id + roi_high_key(8B) + roi_low_key(4B) + 排序后的 roi_index1/2/3.
+    #   材料(可堆叠)查询 roi 恒 0 -> 走简单表(所以一直正常); 装备(脚本含 [random option] 的 CEquipItem)
+    #   被游戏服把零 roi_high WORD 填成 0x7530 -> 查询 roi 非空 -> 只走 ROI 表 => 必须在 ROI 表按
+    #   (item_id, upgrade, roi_high_key=EQUIP_ROI_HIGH, roi_low_key=0, roi_index=0, sep=0) 备行.
+    #   ① 简单表: 在架 (item_id,upgrade) 镜像(材料查均价用; 装备空-roi 查询也用), sep 取挂单真实值(系统=0);
+    #      DELETE+INSERT 整表重建避免旧高价残留, 再 INSERT IGNORE 补游戏模板种子行(AVG_PRICE_SEED_SQL),
+    #      防"无挂单物品"均价被清成 0(v5 回归: 金库 27 个/cera 1 个种子行曾被整表 DELETE 冲掉).
+    #   ② ROI 表: 只重建"带装备 roi 键"的挂单行(游戏自带种子行 key 不同, 不动). 按 (item_id, upgrade 0..MAX)
+    #      展开 —— 客户端上传/浏览时包内 upgrade = 物品实际强化档(0..18 都可能), 逐档备行才能必命中;
+    #      无该档挂单的档用该物品整体均价兜底(非 0 即可, 客户端只展示用).
+    #   (v4/v5 两个旧结论均已作废: 装备不是"只查简单表", sep 也已对齐为挂单真实值 0.)
+    try:
+        cur = conn_mk.cursor()
+        # ---- ① 简单表(材料/空-roi 查询) ----
+        cur.execute("DELETE FROM auction_average_price")
+        cur.execute(
+            "INSERT INTO auction_average_price (item_id, upgrade, average_price, seperate_upgrade) "
+            "SELECT item_id, upgrade, LEAST(CAST(AVG(unit_price) AS UNSIGNED), 2147483647), "
+            "       MIN(COALESCE(seperate_upgrade, 0)) "
+            "FROM auction_main WHERE unit_price > 0 "
+            "GROUP BY item_id, upgrade "
+            "ON DUPLICATE KEY UPDATE average_price = VALUES(average_price), "
+            "    seperate_upgrade = VALUES(seperate_upgrade)")
+        live_groups = cur.rowcount
+        seed_vals = AVG_PRICE_SEED_SQL.get(m.get("db") or "")
+        seed_added = 0
+        if seed_vals:
+            cur.execute(
+                "INSERT IGNORE INTO auction_average_price (item_id, upgrade, average_price, seperate_upgrade) "
+                "VALUES " + seed_vals)
+            seed_added = cur.rowcount
+        conn_mk.commit()
+        # ---- ② ROI 表(装备/非空-roi 查询) ----
+        # 只删本脚本写的装备 ROI 行(精确匹配键), 保留游戏模板种子行.
+        cur.execute("DELETE FROM auction_roi_average_price WHERE roi_high_key = %s AND roi_low_key = 0 "
+                    "AND roi_index1 = 0 AND roi_index2 = 0 AND roi_index3 = 0", (EQUIP_ROI_HIGH,))
+        roi_cleared = cur.rowcount
+        # 在架装备的各强化档均价 + 各物品整体均价(带 roi 键的挂单 = 我们上架的装备)
+        cur.execute("SELECT item_id, upgrade, LEAST(CAST(AVG(unit_price) AS UNSIGNED), 2147483647) "
+                    "FROM auction_main WHERE roi_high_key = %s AND unit_price > 0 GROUP BY item_id, upgrade",
+                    (EQUIP_ROI_HIGH,))
+        per_up = {}
+        for iid, up, p in cur.fetchall():
+            per_up[(int(iid), int(up))] = int(p)
+        cur.execute("SELECT item_id, LEAST(CAST(AVG(unit_price) AS UNSIGNED), 2147483647) "
+                    "FROM auction_main WHERE roi_high_key = %s AND unit_price > 0 GROUP BY item_id",
+                    (EQUIP_ROI_HIGH,))
+        item_avg = {}
+        for iid, p in cur.fetchall():
+            item_avg[int(iid)] = int(p)
+        roi_rows = []
+        for iid, a in item_avg.items():
+            for up in range(0, EQUIP_ROI_MAX_UPGRADE + 1):
+                roi_rows.append((iid, up, EQUIP_ROI_HIGH, 0, 0, 0, 0,
+                                 per_up.get((iid, up), a), 1, 0))
+        for i in range(0, len(roi_rows), _BATCH):
+            chunk = roi_rows[i:i + _BATCH]
+            sql = ("INSERT INTO auction_roi_average_price "
+                   "(item_id, upgrade, roi_high_key, roi_low_key, roi_index1, roi_index2, roi_index3, "
+                   " average_price, real_purchase_count, seperate_upgrade) VALUES "
+                   + ",".join(["(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"] * len(chunk))
+                   + " ON DUPLICATE KEY UPDATE average_price = VALUES(average_price)")
+            flat = []
+            for r in chunk:
+                flat.extend(r)
+            cur.execute(sql, flat)
+        conn_mk.commit()
+        log.info(u"  均价表重建: 简单表 %d 组(补种子 %d); ROI 表装备 %d 件×%d 档 = %d 行(清旧 %d)",
+                 live_groups, seed_added, len(item_avg), EQUIP_ROI_MAX_UPGRADE + 1, len(roi_rows), roi_cleared)
+    except Exception as e:
+        log.warning(u"  均价表回灌失败(不阻断补货): %s", e)
 
 
 # ---- 8. 单市场单轮 / 全市场单轮 ----
